@@ -18,7 +18,7 @@ CHANNEL_CHAT_ID = "@modery_85"
 
 # Webhook configuration for Render
 PORT = int(os.environ.get("PORT", 8000))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL") # Render automatically provides this
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") # Render automatically provides this
 
 # --- Logging Setup ---
 logging.basicConfig(
