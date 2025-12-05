@@ -2,6 +2,8 @@ import os
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+from fastapi import FastAPI
+import uvicorn
 
 # --- Configuration ---
 
@@ -9,13 +11,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 BOT_TOKEN = "8291087862:AAHrKcGMhyuiGEPCuiQnrH3J5Ghsn-7lF8Q"
 
 # The list of Telegram User IDs (integers) who are authorized to approve/reject submissions.
-# These are the IDs you provided: 8043989028 (Creator) and 5342990150 (Admin)
 ADMIN_IDS = [8043989028, 5342990150]
 
 # The target channel username or ID where accepted messages will be posted.
-# If using a username (e.g., "@modery_85"), the bot must be an administrator in the channel.
-# If using an ID (e.g., -1001234567890), the bot must also be an administrator.
 CHANNEL_CHAT_ID = "@modery_85"
+
+# Webhook configuration for Render
+PORT = int(os.environ.get("PORT", 8000))
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") # Render automatically provides this
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -33,12 +36,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Forwards the user's message to all admins for approval."""
+    # Filter to ensure it's a private message (already done in MessageHandler, but good to be safe)
+    if update.message.chat.type != "private":
+        return
+
     user_message = update.message
     user_id = user_message.chat_id
-    
-    # We need to store the message text and the original user's ID for the callback.
-    # We will encode this information in the callback data.
-    # Format: "ACTION|USER_ID|MESSAGE_TEXT" (MESSAGE_TEXT will be truncated for safety)
     
     # Get the text content. Handle different message types (text, photo caption, etc.)
     if user_message.text:
@@ -47,18 +50,15 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         message_text = user_message.caption
     else:
         # For simplicity, we only handle text and captioned media.
-        # For other media, we'll just send a generic text for approval.
         message_text = "Сообщение содержит медиафайл без подписи."
         
-    # Truncate the message text for callback data (max 64 bytes)
-    # We will use context.user_data to store the full message for now,
-    # and only pass a unique ID in the callback data.
-    
     # Generate a unique ID for this submission
     submission_id = str(user_message.message_id) + "_" + str(user_id)
     
     # Store the full message object (or relevant parts) in a temporary storage
-    context.bot_data[submission_id] = {
+    # NOTE: In a production environment, this should be a persistent database (e.g., Redis, PostgreSQL)
+    # For this simple bot, we use bot_data, which is in-memory and will be reset on restart.
+    context.application.bot_data[submission_id] = {
         "user_id": user_id,
         "text": message_text,
         "message_id": user_message.message_id,
@@ -115,7 +115,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     action, submission_id = query.data.split("|")
 
     # Retrieve the submission data
-    submission_data = context.bot_data.get(submission_id)
+    submission_data = context.application.bot_data.get(submission_id)
     
     if not submission_data:
         await query.edit_message_text("❌ Ошибка: Данные предложения не найдены.")
@@ -133,7 +133,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     submission_data["processed_by_id"] = admin_id
     submission_data["processed_by_name"] = query.from_user.full_name
     submission_data["processed_action"] = "принято" if action == "accept" else "отклонено"
-    context.bot_data[submission_id] = submission_data # Update the storage
+    context.application.bot_data[submission_id] = submission_data # Update the storage
 
     original_user_id = submission_data["user_id"]
     
@@ -141,16 +141,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "accept":
         try:
             # 1. Post the message to the channel
-            # We use the full_message dictionary to re-send the original content (text, photo, etc.)
-            full_message = submission_data["full_message"]
-            
-            # The original message was sent from the user to the bot.
-            # We need to re-send the content to the channel.
-            
-            # For simplicity and to handle various media types, we will use a simple text post for now.
-            # For a more robust solution, we would need to check for photo, video, etc., and use the corresponding send_ methods.
-            
-            # For now, we will just post the text/caption.
             await context.bot.send_message(
                 chat_id=CHANNEL_CHAT_ID,
                 text=submission_data["text"]
@@ -174,7 +164,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(f"❌ Ошибка при публикации в канал: {e}")
             # Revert processed status if posting failed
             submission_data["is_processed"] = False
-            context.bot_data[submission_id] = submission_data
+            context.application.bot_data[submission_id] = submission_data
             await context.bot.send_message(
                 chat_id=original_user_id,
                 text="❌ Произошла ошибка при публикации твоего предложения. Попробуй позже или свяжись с администратором."
@@ -193,31 +183,56 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"Администратор: {query.from_user.full_name} (`{admin_id}`)"
         )
 
+# --- Webhook Setup ---
+
+# Initialize FastAPI app
+app = FastAPI()
+
+# Initialize Telegram Application
+application = Application.builder().token(BOT_TOKEN).build()
+
+# Add handlers to the application
+application.add_handler(CommandHandler("start", start_command))
+application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_user_message))
+application.add_handler(CallbackQueryHandler(handle_callback_query))
+
+@app.on_event("startup")
+async def on_startup():
+    """Set the webhook URL on startup."""
+    if WEBHOOK_URL:
+        await application.bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"Webhook set to {WEBHOOK_URL}")
+    else:
+        logger.error("WEBHOOK_URL environment variable not set. Bot will not work.")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Remove the webhook on shutdown."""
+    await application.bot.delete_webhook()
+    logger.info("Webhook deleted.")
+
+@app.post("/")
+async def telegram_webhook(update: dict):
+    """Handle incoming Telegram updates."""
+    await application.update_queue.put(Update.de_json(update, application.bot))
+    return {"message": "OK"}
+
 def main() -> None:
-    """Start the bot."""
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # on different commands - answer in Telegram
-    application.add_handler(CommandHandler("start", start_command))
-
-    # on non-command messages - forward to admins
-    # We use filters.TEXT to only process text messages for simplicity, 
-    # but a more complex filter could be used to handle media with captions.
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_user_message))
-
-    # on callback queries (button presses)
-    application.add_handler(CallbackQueryHandler(handle_callback_query))
-
-    # Run the bot until the user presses Ctrl-C
-    logger.info("Bot started. Press Ctrl-C to stop.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    """Start the bot using uvicorn to serve the FastAPI app."""
+    # The Application must be run in a separate thread/process for the webhook to work
+    # We start the Application in the background
+    application.start()
+    
+    # We run the FastAPI app with uvicorn, binding to the port provided by the environment
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
-    # Check if the token is still the placeholder
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("!!! WARNING: Please replace 'YOUR_BOT_TOKEN_HERE' in bot.py with your actual bot token.")
-        print("The bot will not run until the token is updated.")
+    elif not WEBHOOK_URL:
+        print("!!! WARNING: WEBHOOK_URL environment variable is not set. This is expected during local testing.")
+        print("For deployment on Render, ensure WEBHOOK_URL is set.")
+        # Fallback to polling for local testing if needed, but we'll skip for deployment
+        # application.run_polling(allowed_updates=Update.ALL_TYPES)
     else:
         main()
-
