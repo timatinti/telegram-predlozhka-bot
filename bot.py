@@ -204,7 +204,7 @@ def main() -> None:
     # on non-command messages - forward to admins
     # We use filters.TEXT to only process text messages for simplicity, 
     # but a more complex filter could be used to handle media with captions.
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_message))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_user_message))
 
     # on callback queries (button presses)
     application.add_handler(CallbackQueryHandler(handle_callback_query))
@@ -220,3 +220,4 @@ if __name__ == "__main__":
         print("The bot will not run until the token is updated.")
     else:
         main()
+
