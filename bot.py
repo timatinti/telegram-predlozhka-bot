@@ -12,6 +12,7 @@ BOT_TOKEN = "8291087862:AAHrKcGMhyuiGEPCuiQnrH3J5Ghsn-7lF8Q"
 
 # The list of Telegram User IDs (integers) who are authorized to approve/reject submissions.
 ADMIN_IDS = [8043989028, 5342990150]
+CREATOR_ID = 8043989028 # ID of the main creator for diagnostic messages
 
 # The target channel username or ID where accepted messages will be posted.
 CHANNEL_CHAT_ID = "@modery_85"
@@ -36,7 +37,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Forwards the user's message to all admins for approval."""
-    # Filter to ensure it's a private message (already done in MessageHandler, but good to be safe)
+    # Filter to ensure it's a private message
     if update.message.chat.type != "private":
         return
 
@@ -56,8 +57,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     submission_id = str(user_message.message_id) + "_" + str(user_id)
     
     # Store the full message object (or relevant parts) in a temporary storage
-    # NOTE: In a production environment, this should be a persistent database (e.g., Redis, PostgreSQL)
-    # For this simple bot, we use bot_data, which is in-memory and will be reset on restart.
     context.application.bot_data[submission_id] = {
         "user_id": user_id,
         "text": message_text,
@@ -83,6 +82,9 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Текст:\n---\n{message_text}\n---"
     )
 
+    sent_count = 0
+    failed_admins = []
+    
     # Send the message to all admins
     for admin_id in ADMIN_IDS:
         try:
@@ -92,8 +94,29 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
+            sent_count += 1
         except Exception as e:
             logger.error(f"Could not send message to admin {admin_id}: {e}")
+            failed_admins.append(str(admin_id))
+
+    # --- DIAGNOSTIC ADDITION ---
+    if sent_count == 0 and user_id != CREATOR_ID:
+        diagnostic_message = (
+            "⚠️ **ДИАГНОСТИКА: СБОЙ ОТПРАВКИ** ⚠️\n\n"
+            "Бот не смог отправить сообщение для утверждения ни одному администратору.\n"
+            f"Неудачные ID: {', '.join(failed_admins)}\n"
+            "Наиболее вероятная причина: **Неверный ID** или администратор **не написал боту /start**.\n"
+            "Пожалуйста, проверьте ID администраторов."
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=CREATOR_ID,
+                text=diagnostic_message,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Could not send diagnostic message to creator {CREATOR_ID}: {e}")
+    # --- END DIAGNOSTIC ADDITION ---
 
     # Inform the user that their message has been sent for review
     await user_message.reply_text(
@@ -203,7 +226,7 @@ async def on_startup():
         await application.bot.set_webhook(url=WEBHOOK_URL)
         logger.info(f"Webhook set to {WEBHOOK_URL}")
     else:
-        logger.error("WEBHOOK_URL environment variable not set. Bot will not work.")
+        logger.error("RENDER_EXTERNAL_URL environment variable not set. Bot will not work.")
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -230,9 +253,6 @@ if __name__ == "__main__":
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("!!! WARNING: Please replace 'YOUR_BOT_TOKEN_HERE' in bot.py with your actual bot token.")
     elif not WEBHOOK_URL:
-        print("!!! WARNING: WEBHOOK_URL environment variable is not set. This is expected during local testing.")
-        print("For deployment on Render, ensure WEBHOOK_URL is set.")
-        # Fallback to polling for local testing if needed, but we'll skip for deployment
-        # application.run_polling(allowed_updates=Update.ALL_TYPES)
+        print("!!! WARNING: RENDER_EXTERNAL_URL environment variable is not set. This is expected during local testing.")
     else:
         main()
