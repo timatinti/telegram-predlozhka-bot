@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from fastapi import FastAPI
@@ -10,16 +11,46 @@ import uvicorn
 # IMPORTANT: Replace with your actual bot token from BotFather
 BOT_TOKEN = "8291087862:AAHrKcGMhyuiGEPCuiQnrH3J5Ghsn-7lF8Q"
 
-# The list of Telegram User IDs (integers) who are authorized to approve/reject submissions.
-ADMIN_IDS = [8043989028, 5342990150]
-CREATOR_ID = 8043989028 # ID of the main creator for diagnostic messages
-
 # The target channel username or ID where accepted messages will be posted.
 CHANNEL_CHAT_ID = "@modery_85"
 
 # Webhook configuration for Render
 PORT = int(os.environ.get("PORT", 8000))
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") # Render automatically provides this
+
+# --- Admin Configuration (Using a separate JSON file for flexibility) ---
+# This file will store the mapping: {"@username": 1234567890}
+ADMIN_CONFIG_FILE = "admin_config.json"
+
+def load_admin_ids():
+    """Loads admin IDs from the configuration file."""
+    try:
+        with open(ADMIN_CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+            # Filter out None values (for users who haven't started the bot yet)
+            return {username: user_id for username, user_id in config.items() if user_id is not None}
+    except FileNotFoundError:
+        logger.error(f"Admin config file not found: {ADMIN_CONFIG_FILE}")
+        return {}
+    except json.JSONDecodeError:
+        logger.error(f"Error decoding JSON from {ADMIN_CONFIG_FILE}")
+        return {}
+
+def save_admin_id(username, user_id):
+    """Saves a new admin ID to the configuration file."""
+    try:
+        with open(ADMIN_CONFIG_FILE, 'r+') as f:
+            config = json.load(f)
+            config[username] = user_id
+            f.seek(0)
+            json.dump(config, f, indent=4)
+            f.truncate()
+    except FileNotFoundError:
+        # If file doesn't exist, create it with the new user
+        with open(ADMIN_CONFIG_FILE, 'w') as f:
+            json.dump({username: user_id}, f, indent=4)
+    except Exception as e:
+        logger.error(f"Error saving admin ID for {username}: {e}")
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -30,13 +61,22 @@ logger = logging.getLogger(__name__)
 # --- Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the command /start is issued."""
+    """Sends a welcome message and registers the user's ID if they are a configured admin."""
+    user = update.effective_user
+    
+    # Check if the user is a configured admin (by username)
+    # NOTE: This requires the admin to have a public username set.
+    if user.username and f"@{user.username}" in context.application.bot_data.get("admin_usernames", []):
+        # Save the ID for future use
+        save_admin_id(f"@{user.username}", user.id)
+        logger.info(f"Registered admin ID for @{user.username}: {user.id}")
+        
     await update.message.reply_text(
         "Привет! Отправь мне сообщение, которое ты хочешь предложить для публикации в канале."
     )
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forwards the user's message to all admins for approval."""
+    """Forwards the user's message to all registered admins for approval."""
     # Filter to ensure it's a private message
     if update.message.chat.type != "private":
         return
@@ -50,7 +90,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif user_message.caption:
         message_text = user_message.caption
     else:
-        # For simplicity, we only handle text and captioned media.
         message_text = "Сообщение содержит медиафайл без подписи."
         
     # Generate a unique ID for this submission
@@ -63,7 +102,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         "message_id": user_message.message_id,
         "chat_id": user_message.chat_id,
         "is_processed": False,
-        "full_message": user_message.to_dict() # Store the full message for forwarding
+        "full_message": user_message.to_dict()
     }
 
     # Create the inline keyboard
@@ -82,11 +121,12 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Текст:\n---\n{message_text}\n---"
     )
 
+    admin_ids = list(context.application.bot_data.get("admin_ids", {}).values())
     sent_count = 0
     failed_admins = []
     
-    # Send the message to all admins
-    for admin_id in ADMIN_IDS:
+    # Send the message to all registered admin IDs
+    for admin_id in admin_ids:
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -100,7 +140,10 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             failed_admins.append(str(admin_id))
 
     # --- DIAGNOSTIC ADDITION ---
-    if sent_count == 0 and user_id != CREATOR_ID:
+    # The creator's ID is the first one in the config file.
+    creator_id = next(iter(admin_ids), None)
+    
+    if sent_count == 0 and user_id != creator_id and creator_id is not None:
         diagnostic_message = (
             "⚠️ **ДИАГНОСТИКА: СБОЙ ОТПРАВКИ** ⚠️\n\n"
             "Бот не смог отправить сообщение для утверждения ни одному администратору.\n"
@@ -110,12 +153,12 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         try:
             await context.bot.send_message(
-                chat_id=CREATOR_ID,
+                chat_id=creator_id,
                 text=diagnostic_message,
                 parse_mode="Markdown"
             )
         except Exception as e:
-            logger.error(f"Could not send diagnostic message to creator {CREATOR_ID}: {e}")
+            logger.error(f"Could not send diagnostic message to creator {creator_id}: {e}")
     # --- END DIAGNOSTIC ADDITION ---
 
     # Inform the user that their message has been sent for review
@@ -128,9 +171,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer() # Acknowledge the button press
 
+    admin_ids = list(context.application.bot_data.get("admin_ids", {}).values())
+    
     # Check if the user is an authorized admin
     admin_id = query.from_user.id
-    if admin_id not in ADMIN_IDS:
+    if admin_id not in admin_ids:
         await query.edit_message_text("❌ У вас нет прав для выполнения этого действия.")
         return
 
@@ -221,7 +266,12 @@ application.add_handler(CallbackQueryHandler(handle_callback_query))
 
 @app.on_event("startup")
 async def on_startup():
-    """Set the webhook URL on startup."""
+    """Set the webhook URL on startup and load admin config."""
+    # Load admin config
+    admin_config = load_admin_ids()
+    application.bot_data["admin_ids"] = admin_config
+    application.bot_data["admin_usernames"] = list(admin_config.keys())
+    
     if WEBHOOK_URL:
         await application.bot.set_webhook(url=WEBHOOK_URL)
         logger.info(f"Webhook set to {WEBHOOK_URL}")
@@ -243,7 +293,6 @@ async def telegram_webhook(update: dict):
 def main() -> None:
     """Start the bot using uvicorn to serve the FastAPI app."""
     # The Application must be run in a separate thread/process for the webhook to work
-    # We start the Application in the background
     application.start()
     
     # We run the FastAPI app with uvicorn, binding to the port provided by the environment
